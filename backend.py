@@ -30,10 +30,20 @@ from langchain_google_genai import ChatGoogleGenerativeAI
 
 from langgraph.graph import StateGraph, START, END
 
+# =========================================================
+# TAVILY
+# =========================================================
+
+from langchain_tavily import TavilySearch
+
+# =========================================================
+# ENV
+# =========================================================
+
 load_dotenv()
 
 # =========================================================
-# LOAD DOCUMENTS
+# LOAD PDF DOCUMENTS
 # =========================================================
 
 docs = (
@@ -61,7 +71,7 @@ for d in chunks:
     )
 
 # =========================================================
-# EMBEDDING MODEL
+# FREE EMBEDDING MODEL
 # =========================================================
 
 embedding_model = HuggingFaceEmbeddings(
@@ -69,7 +79,7 @@ embedding_model = HuggingFaceEmbeddings(
 )
 
 # =========================================================
-# FAISS VECTOR STORE
+# FAISS VECTOR DATABASE
 # =========================================================
 
 vector_store = FAISS.from_documents(
@@ -93,7 +103,7 @@ llm = ChatGoogleGenerativeAI(
 )
 
 # =========================================================
-# RETRIEVAL EVALUATION THRESHOLDS
+# RETRIEVAL THRESHOLDS
 # =========================================================
 
 UPPER_TH = 0.7
@@ -115,9 +125,14 @@ class State(TypedDict):
     reason: str
 
     strips: List[str]
+
     kept_strips: List[str]
 
     refined_context: str
+
+    web_query: str
+
+    web_docs: List[Document]
 
     answer: str
 
@@ -125,7 +140,7 @@ class State(TypedDict):
 # RETRIEVE NODE
 # =========================================================
 
-def retrieve(state: State) -> State:
+def retrieve_node(state: State) -> State:
 
     q = state["question"]
 
@@ -136,7 +151,7 @@ def retrieve(state: State) -> State:
     }
 
 # =========================================================
-# RETRIEVAL EVALUATION MODEL
+# RETRIEVAL EVALUATION
 # =========================================================
 
 class DocEvalScore(BaseModel):
@@ -155,7 +170,8 @@ You will be given ONE retrieved chunk and a question.
 Return a relevance score in [0.0, 1.0].
 
 Scoring:
-1.0 = chunk alone can answer question
+
+1.0 = chunk alone can answer the question
 0.0 = irrelevant chunk
 
 Be conservative with high scores.
@@ -185,7 +201,7 @@ doc_eval_chain = (
 # RETRIEVAL EVALUATION NODE
 # =========================================================
 
-def evaluate_retrieval(state: State) -> State:
+def eval_each_doc_node(state: State) -> State:
 
     q = state["question"]
 
@@ -202,7 +218,6 @@ def evaluate_retrieval(state: State) -> State:
 
         scores.append(result.score)
 
-        # Keep moderately relevant docs
         if result.score > LOWER_TH:
             good_docs.append(doc)
 
@@ -260,7 +275,7 @@ def decompose_to_sentences(text: str) -> List[str]:
     ]
 
 # =========================================================
-# SENTENCE FILTER MODEL
+# SENTENCE FILTER
 # =========================================================
 
 class KeepOrDrop(BaseModel):
@@ -298,6 +313,99 @@ filter_chain = (
 )
 
 # =========================================================
+# QUERY REWRITE FOR WEB SEARCH
+# =========================================================
+
+class WebQuery(BaseModel):
+    query: str
+
+rewrite_prompt = ChatPromptTemplate.from_messages(
+    [
+        (
+            "system",
+            """
+Rewrite the user question into a short web search query.
+
+Rules:
+- Keep it concise
+- Use keywords only
+- Add recency if needed
+- Do NOT answer question
+
+Return JSON only.
+"""
+        ),
+        (
+            "human",
+            """
+Question:
+{question}
+"""
+        )
+    ]
+)
+
+rewrite_chain = (
+    rewrite_prompt
+    | llm.with_structured_output(WebQuery)
+)
+
+def rewrite_query_node(state: State) -> State:
+
+    result = rewrite_chain.invoke({
+        "question": state["question"]
+    })
+
+    return {
+        "web_query": result.query
+    }
+
+# =========================================================
+# WEB SEARCH
+# =========================================================
+
+tavily = TavilySearch(
+    max_results=5
+)
+
+def web_search_node(state: State) -> State:
+
+    q = state.get("web_query") or state["question"]
+
+    results = tavily.invoke(q)
+
+    web_docs = []
+
+    for r in results:
+
+        title = r.get("title", "")
+        url = r.get("url", "")
+        content = r.get("content", "")
+
+        text = f"""
+TITLE: {title}
+
+URL: {url}
+
+CONTENT:
+{content}
+"""
+
+        web_docs.append(
+            Document(
+                page_content=text,
+                metadata={
+                    "title": title,
+                    "url": url
+                }
+            )
+        )
+
+    return {
+        "web_docs": web_docs
+    }
+
+# =========================================================
 # REFINE NODE
 # =========================================================
 
@@ -305,10 +413,36 @@ def refine(state: State) -> State:
 
     q = state["question"]
 
-    # Combine only good docs
+    # =====================================================
+    # CORRECT
+    # =====================================================
+
+    if state["verdict"] == "CORRECT":
+
+        docs_to_use = state["good_docs"]
+
+    # =====================================================
+    # INCORRECT
+    # =====================================================
+
+    elif state["verdict"] == "INCORRECT":
+
+        docs_to_use = state["web_docs"]
+
+    # =====================================================
+    # AMBIGUOUS
+    # =====================================================
+
+    else:
+
+        docs_to_use = (
+            state["good_docs"]
+            + state["web_docs"]
+        )
+
     context = "\n\n".join(
         d.page_content
-        for d in state["good_docs"]
+        for d in docs_to_use
     ).strip()
 
     # STEP 1 — DECOMPOSE
@@ -337,7 +471,7 @@ def refine(state: State) -> State:
     }
 
 # =========================================================
-# GENERATION PROMPT
+# GENERATION
 # =========================================================
 
 answer_prompt = ChatPromptTemplate.from_messages(
@@ -352,7 +486,7 @@ Answer ONLY using the provided context.
 If context is insufficient,
 say:
 
-"I don't know based on the provided books."
+"I don't know."
 """
         ),
         (
@@ -362,15 +496,11 @@ Question:
 {question}
 
 Context:
-{refined_context}
+{context}
 """
         )
     ]
 )
-
-# =========================================================
-# GENERATE NODE
-# =========================================================
 
 def generate(state: State) -> State:
 
@@ -378,41 +508,11 @@ def generate(state: State) -> State:
 
     result = chain.invoke({
         "question": state["question"],
-        "refined_context": state["refined_context"]
+        "context": state["refined_context"]
     })
 
     return {
         "answer": result.content
-    }
-
-# =========================================================
-# FAIL NODE
-# =========================================================
-
-def fail_node(state: State) -> State:
-
-    return {
-        "answer": f"""
-I could not find relevant information.
-
-Reason:
-{state['reason']}
-"""
-    }
-
-# =========================================================
-# AMBIGUOUS NODE
-# =========================================================
-
-def ambiguous_node(state: State) -> State:
-
-    return {
-        "answer": f"""
-Retrieved information is ambiguous.
-
-Reason:
-{state['reason']}
-"""
     }
 
 # =========================================================
@@ -422,13 +522,12 @@ Reason:
 def route_after_eval(state: State):
 
     if state["verdict"] == "CORRECT":
+
         return "refine"
 
-    elif state["verdict"] == "INCORRECT":
-        return "fail"
-
     else:
-        return "ambiguous"
+
+        return "rewrite_query"
 
 # =========================================================
 # LANGGRAPH
@@ -436,43 +535,87 @@ def route_after_eval(state: State):
 
 graph = StateGraph(State)
 
-# Nodes
-graph.add_node("retrieve", retrieve)
+# =========================================================
+# NODES
+# =========================================================
 
-graph.add_node("evaluate", evaluate_retrieval)
+graph.add_node(
+    "retrieve",
+    retrieve_node
+)
 
-graph.add_node("refine", refine)
+graph.add_node(
+    "evaluate",
+    eval_each_doc_node
+)
 
-graph.add_node("generate", generate)
+graph.add_node(
+    "rewrite_query",
+    rewrite_query_node
+)
 
-graph.add_node("fail", fail_node)
+graph.add_node(
+    "web_search",
+    web_search_node
+)
 
-graph.add_node("ambiguous", ambiguous_node)
+graph.add_node(
+    "refine",
+    refine
+)
 
-# Flow
-graph.add_edge(START, "retrieve")
+graph.add_node(
+    "generate",
+    generate
+)
 
-graph.add_edge("retrieve", "evaluate")
+# =========================================================
+# FLOW
+# =========================================================
+
+graph.add_edge(
+    START,
+    "retrieve"
+)
+
+graph.add_edge(
+    "retrieve",
+    "evaluate"
+)
 
 graph.add_conditional_edges(
     "evaluate",
     route_after_eval,
     {
         "refine": "refine",
-        "fail": "fail",
-        "ambiguous": "ambiguous"
+        "rewrite_query": "rewrite_query"
     }
 )
 
-graph.add_edge("refine", "generate")
+graph.add_edge(
+    "rewrite_query",
+    "web_search"
+)
 
-graph.add_edge("generate", END)
+graph.add_edge(
+    "web_search",
+    "refine"
+)
 
-graph.add_edge("fail", END)
+graph.add_edge(
+    "refine",
+    "generate"
+)
 
-graph.add_edge("ambiguous", END)
+graph.add_edge(
+    "generate",
+    END
+)
 
-# Compile
+# =========================================================
+# COMPILE
+# =========================================================
+
 app = graph.compile()
 
 # =========================================================
@@ -498,9 +641,14 @@ while True:
         "reason": "",
 
         "strips": [],
+
         "kept_strips": [],
 
         "refined_context": "",
+
+        "web_query": "",
+
+        "web_docs": [],
 
         "answer": ""
     })
