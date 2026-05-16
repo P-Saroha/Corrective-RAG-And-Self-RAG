@@ -1,3 +1,20 @@
+# Environment variables
 .env
-myenv
-documents
+
+# Virtual environment
+myenv/
+
+# Documents folder
+documents/
+
+# Python cache
+__pycache__/
+
+# Jupyter notebook checkpoints
+.ipynb_checkpoints/
+
+# FAISS index
+faiss_index/
+
+# OS files
+.DS_Store
