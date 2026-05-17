@@ -16,16 +16,16 @@ CRAG is a corrective retrieval-augmented generation (RAG) app that evaluates ret
 
 ```mermaid
 flowchart TD
-    A[User Question] --> B[Retrieve from FAISS]
-    B --> C[Evaluate Chunks]
-    C -->|Correct| D[Refine Local Context]
-    C -->|Ambiguous| E[Rewrite Query]
-    C -->|Incorrect| E[Rewrite Query]
-    E --> F[Web Search (Tavily)]
-    F --> G[Refine Combined Context]
-    D --> H[Generate Answer]
-    G --> H[Generate Answer]
-    H --> I[Streamlit UI]
+  A[User Question] --> B[Retrieve from FAISS]
+  B --> C[Evaluate Chunks]
+  C -->|Correct| D[Refine Local Context]
+  C -->|Ambiguous| E[Rewrite Query]
+  C -->|Incorrect| E[Rewrite Query]
+  E --> F[Web Search (Tavily)]
+  F --> G[Refine Combined Context]
+  D --> H[Generate Answer]
+  G --> H[Generate Answer]
+  H --> I[Streamlit UI]
 ```
 
 ## Project Structure
