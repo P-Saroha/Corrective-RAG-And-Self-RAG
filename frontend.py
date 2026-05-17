@@ -92,7 +92,7 @@ Production-style RAG system using:
 
 with st.sidebar:
 
-    st.header("⚙️ System Features")
+    st.header(" System Features")
 
     st.markdown("""
 - PDF-based RAG
@@ -154,7 +154,7 @@ if st.button("Generate Answer"):
         # ANSWER
         # =================================================
 
-        st.subheader("📌 Answer")
+        st.subheader(" Answer")
 
         st.markdown(
             f"""
@@ -169,7 +169,7 @@ if st.button("Generate Answer"):
         # VERDICT
         # =================================================
 
-        st.subheader("📊 Retrieval Verdict")
+        st.subheader(" Retrieval Verdict")
 
         verdict = result["verdict"]
 
@@ -198,7 +198,7 @@ if st.button("Generate Answer"):
         # REASON
         # =================================================
 
-        st.subheader("🧠 Reason")
+        st.subheader(" Reason")
 
         st.markdown(
             f"""
@@ -213,7 +213,7 @@ if st.button("Generate Answer"):
         # CONTEXT
         # =================================================
 
-        with st.expander("📚 View Refined Context"):
+        with st.expander(" View Refined Context"):
 
             st.write(result["refined_context"])
 
@@ -221,7 +221,7 @@ if st.button("Generate Answer"):
         # KEPT SENTENCES
         # =================================================
 
-        with st.expander("✂️ View Filtered Sentences"):
+        with st.expander(" View Filtered Sentences"):
 
             for idx, sentence in enumerate(
                 result["kept_strips"],

@@ -1,6 +1,8 @@
 from typing import List, TypedDict
 import re
 import os
+import time
+from functools import lru_cache
 
 from dotenv import load_dotenv
 from pydantic import BaseModel
@@ -43,54 +45,73 @@ from langchain_tavily import TavilySearch
 load_dotenv()
 
 # =========================================================
-# LOAD PDF DOCUMENTS
+# FAISS CACHE
 # =========================================================
 
-docs = (
-    PyPDFLoader("./documents/book1.pdf").load()
-    + PyPDFLoader("./documents/book2.pdf").load()
-    + PyPDFLoader("./documents/book3.pdf").load()
-)
+FAISS_INDEX_DIR = "./faiss_index"
 
-# =========================================================
-# TEXT SPLITTING
-# =========================================================
+@lru_cache(maxsize=1)
+def get_embedding_model() -> HuggingFaceEmbeddings:
 
-splitter = RecursiveCharacterTextSplitter(
-    chunk_size=900,
-    chunk_overlap=150
-)
-
-chunks = splitter.split_documents(docs)
-
-for d in chunks:
-    d.page_content = (
-        d.page_content
-        .encode("utf-8", "ignore")
-        .decode("utf-8", "ignore")
+    return HuggingFaceEmbeddings(
+        model_name="sentence-transformers/all-MiniLM-L6-v2"
     )
 
-# =========================================================
-# FREE EMBEDDING MODEL
-# =========================================================
+def _load_documents() -> List[Document]:
 
-embedding_model = HuggingFaceEmbeddings(
-    model_name="sentence-transformers/all-MiniLM-L6-v2"
-)
+    return (
+        PyPDFLoader("./documents/book1.pdf").load()
+        + PyPDFLoader("./documents/book2.pdf").load()
+        + PyPDFLoader("./documents/book3.pdf").load()
+    )
 
-# =========================================================
-# FAISS VECTOR DATABASE
-# =========================================================
+def _split_documents(docs: List[Document]) -> List[Document]:
 
-vector_store = FAISS.from_documents(
-    chunks,
-    embedding_model
-)
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=900,
+        chunk_overlap=150
+    )
 
-retriever = vector_store.as_retriever(
-    search_type="similarity",
-    search_kwargs={"k": 4}
-)
+    chunks = splitter.split_documents(docs)
+
+    for d in chunks:
+        d.page_content = (
+            d.page_content
+            .encode("utf-8", "ignore")
+            .decode("utf-8", "ignore")
+        )
+
+    return chunks
+
+@lru_cache(maxsize=1)
+def get_vector_store() -> FAISS:
+
+    if os.path.isdir(FAISS_INDEX_DIR):
+        return FAISS.load_local(
+            FAISS_INDEX_DIR,
+            get_embedding_model(),
+            allow_dangerous_deserialization=True
+        )
+
+    docs = _load_documents()
+    chunks = _split_documents(docs)
+
+    store = FAISS.from_documents(
+        chunks,
+        get_embedding_model()
+    )
+
+    store.save_local(FAISS_INDEX_DIR)
+
+    return store
+
+@lru_cache(maxsize=1)
+def get_retriever():
+
+    return get_vector_store().as_retriever(
+        search_type="similarity",
+        search_kwargs={"k": 4}
+    )
 
 # =========================================================
 # GEMINI 2.5 FLASH
@@ -101,6 +122,39 @@ llm = ChatGoogleGenerativeAI(
     google_api_key=os.getenv("GOOGLE_API_KEY"),
     temperature=0
 )
+
+# =========================================================
+# RETRY HANDLING
+# =========================================================
+
+def _extract_retry_seconds(error_text: str) -> float:
+
+    match = re.search(r"retryDelay': '([0-9.]+)s'", error_text)
+
+    if match:
+        return float(match.group(1))
+
+    return 5.0
+
+def invoke_with_retry(chain, payload, max_attempts: int = 3):
+
+    for attempt in range(1, max_attempts + 1):
+
+        try:
+            return chain.invoke(payload)
+
+        except Exception as exc:
+
+            error_text = str(exc)
+
+            if "RESOURCE_EXHAUSTED" not in error_text:
+                raise
+
+            if attempt == max_attempts:
+                raise
+
+            delay = _extract_retry_seconds(error_text)
+            time.sleep(delay)
 
 # =========================================================
 # RETRIEVAL THRESHOLDS
@@ -144,7 +198,7 @@ def retrieve_node(state: State) -> State:
 
     q = state["question"]
 
-    retrieved_docs = retriever.invoke(q)
+    retrieved_docs = get_retriever().invoke(q)
 
     return {
         "docs": retrieved_docs
@@ -211,7 +265,7 @@ def eval_each_doc_node(state: State) -> State:
 
     for doc in state["docs"]:
 
-        result = doc_eval_chain.invoke({
+        result = invoke_with_retry(doc_eval_chain, {
             "question": q,
             "chunk": doc.page_content
         })
@@ -352,7 +406,7 @@ rewrite_chain = (
 
 def rewrite_query_node(state: State) -> State:
 
-    result = rewrite_chain.invoke({
+    result = invoke_with_retry(rewrite_chain, {
         "question": state["question"]
     })
 
@@ -364,11 +418,17 @@ def rewrite_query_node(state: State) -> State:
 # WEB SEARCH
 # =========================================================
 
+TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")
+
 tavily = TavilySearch(
-    max_results=5
+    max_results=5,
+    tavily_api_key=TAVILY_API_KEY
 )
 
 def web_search_node(state: State) -> State:
+
+    if not TAVILY_API_KEY:
+        raise RuntimeError("Missing TAVILY_API_KEY in environment or .env file.")
 
     q = state.get("web_query") or state["question"]
 
@@ -453,7 +513,7 @@ def refine(state: State) -> State:
 
     for sentence in strips:
 
-        result = filter_chain.invoke({
+        result = invoke_with_retry(filter_chain, {
             "question": q,
             "sentence": sentence
         })
@@ -506,7 +566,7 @@ def generate(state: State) -> State:
 
     chain = answer_prompt | llm
 
-    result = chain.invoke({
+    result = invoke_with_retry(chain, {
         "question": state["question"],
         "context": state["refined_context"]
     })
@@ -622,51 +682,53 @@ app = graph.compile()
 # RUN
 # =========================================================
 
-while True:
+if __name__ == "__main__":
 
-    question = input("\nAsk Question: ")
+    while True:
 
-    if question.lower() == "exit":
-        break
+        question = input("\nAsk Question: ")
 
-    result = app.invoke({
+        if question.lower() == "exit":
+            break
 
-        "question": question,
+        result = app.invoke({
 
-        "docs": [],
+            "question": question,
 
-        "good_docs": [],
+            "docs": [],
 
-        "verdict": "",
-        "reason": "",
+            "good_docs": [],
 
-        "strips": [],
+            "verdict": "",
+            "reason": "",
 
-        "kept_strips": [],
+            "strips": [],
 
-        "refined_context": "",
+            "kept_strips": [],
 
-        "web_query": "",
+            "refined_context": "",
 
-        "web_docs": [],
+            "web_query": "",
 
-        "answer": ""
-    })
+            "web_docs": [],
 
-    print("\n" + "=" * 60)
-    print("ANSWER")
-    print("=" * 60)
+            "answer": ""
+        })
 
-    print(result["answer"])
+        print("\n" + "=" * 60)
+        print("ANSWER")
+        print("=" * 60)
 
-    print("\n" + "=" * 60)
-    print("RETRIEVAL VERDICT")
-    print("=" * 60)
+        print(result["answer"])
 
-    print(result["verdict"])
+        print("\n" + "=" * 60)
+        print("RETRIEVAL VERDICT")
+        print("=" * 60)
 
-    print("\n" + "=" * 60)
-    print("REASON")
-    print("=" * 60)
+        print(result["verdict"])
 
-    print(result["reason"])
+        print("\n" + "=" * 60)
+        print("REASON")
+        print("=" * 60)
+
+        print(result["reason"])
