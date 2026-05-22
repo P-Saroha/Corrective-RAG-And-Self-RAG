@@ -1,5 +1,5 @@
 import streamlit as st
-from backend import app
+from CRAG.backend import app
 
 # =========================================================
 # PAGE CONFIG
